@@ -33,6 +33,16 @@ SEARCH_MAX_OUTPUT_TOKENS = 256
 SEARCH_REQUEST_COST_CEILING_USD = 0.1
 SEARCH_MAX_RESULTS = 10
 SEARCH_MAX_CHARACTERS = 2_000
+PROVIDER_ERROR_BODY_MAX_BYTES = 16_384
+PROVIDER_ERROR_VALUE_MAX_BYTES = 4_096
+PROVIDER_ERROR_COLLECTION_MAX_ITEMS = 50
+PROVIDER_ERROR_MAX_DEPTH = 6
+PROVIDER_ERROR_HEADERS = frozenset(
+    {"cf-ray", "content-type", "openrouter-processing-time", "retry-after", "x-request-id"}
+)
+PROVIDER_SECRET_KEYS = frozenset(
+    {"api-key", "api_key", "authorization", "cookie", "password", "secret", "set-cookie", "token"}
+)
 SEARCH_SYSTEM_PROMPT = (
     "Use web search exactly once for the supplied query. After the search, respond with exactly: Search complete."
 )
@@ -236,6 +246,85 @@ def load_starting_points(
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _sanitize_provider_error_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound and redact untrusted provider error data before writing it to a private trace."""
+    if depth >= PROVIDER_ERROR_MAX_DEPTH:
+        return "[maximum depth reached]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (raw_key, item) in enumerate(value.items()):
+            if index >= PROVIDER_ERROR_COLLECTION_MAX_ITEMS:
+                result["[truncated]"] = f"{len(value) - index} additional fields"
+                break
+            key = str(raw_key)
+            normalized_key = key.casefold()
+            result[key] = (
+                "[redacted]"
+                if normalized_key in PROVIDER_SECRET_KEYS
+                else _sanitize_provider_error_value(item, depth=depth + 1)
+            )
+        return result
+    if isinstance(value, list):
+        result = [
+            _sanitize_provider_error_value(item, depth=depth + 1)
+            for item in value[:PROVIDER_ERROR_COLLECTION_MAX_ITEMS]
+        ]
+        if len(value) > PROVIDER_ERROR_COLLECTION_MAX_ITEMS:
+            result.append(f"[{len(value) - PROVIDER_ERROR_COLLECTION_MAX_ITEMS} additional items]")
+        return result
+    if isinstance(value, str):
+        return _utf8_prefix(value, PROVIDER_ERROR_VALUE_MAX_BYTES)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _utf8_prefix(str(value), PROVIDER_ERROR_VALUE_MAX_BYTES)
+
+
+def _provider_http_failure(error: httpx.HTTPStatusError) -> dict[str, Any]:
+    """Project one failed provider response into a bounded, credential-safe trace event."""
+    response = error.response
+    body = response.content
+    headers = {
+        name.casefold(): value
+        for name, value in response.headers.items()
+        if name.casefold() in PROVIDER_ERROR_HEADERS
+    }
+    details: dict[str, Any] = {
+        "http_status": response.status_code,
+        "response_sha256": hashlib.sha256(body).hexdigest(),
+    }
+    if headers:
+        details["response_headers"] = headers
+    if len(body) > PROVIDER_ERROR_BODY_MAX_BYTES:
+        details["response_body_bytes"] = len(body)
+        details["response_body_truncated"] = True
+    else:
+        try:
+            parsed = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+        if parsed is not None:
+            details["provider_response"] = _sanitize_provider_error_value(parsed)
+        elif body:
+            details["provider_response_text"] = _utf8_prefix(
+                body.decode("utf-8", errors="replace"), PROVIDER_ERROR_VALUE_MAX_BYTES
+            )
+    return details
+
+
+def _provider_http_message(capability: str, error: httpx.HTTPStatusError) -> str:
+    details = _provider_http_failure(error)
+    provider_response = details.get("provider_response")
+    provider_error = provider_response.get("error") if isinstance(provider_response, dict) else None
+    provider_message = provider_error.get("message") if isinstance(provider_error, dict) else None
+    message = f"{capability} provider request failed with HTTP {error.response.status_code}"
+    if isinstance(provider_message, str) and provider_message:
+        message += f": {provider_message}"
+    request_id = (details.get("response_headers") or {}).get("x-request-id")
+    if request_id:
+        message += f" (request ID {request_id})"
+    return message
 
 
 def _public_address(address: str) -> bool:
@@ -554,14 +643,17 @@ class WorldCapabilityState:
                     key,
                     Usage(calls=1, request_bytes=requested.request_bytes),
                 )
-            self._append_log(
-                {
-                    "type": "search_failed",
-                    "reservation_key": key,
-                    "error": type(error).__name__,
-                    "message": str(error),
-                }
-            )
+            failure = {
+                "type": "search_failed",
+                "reservation_key": key,
+                "error": type(error).__name__,
+                "message": str(error),
+            }
+            if isinstance(error, httpx.HTTPStatusError):
+                failure.update(_provider_http_failure(error))
+            self._append_log(failure)
+            if isinstance(error, httpx.HTTPStatusError):
+                raise WorldCapabilityError(_provider_http_message("web-search", error)) from error
             raise
 
     async def ask(self, query: str) -> dict[str, object]:
@@ -708,9 +800,17 @@ class WorldCapabilityState:
                     key,
                     Usage(calls=1, request_bytes=requested.request_bytes),
                 )
-            self._append_log(
-                {"type": "ask_failed", "reservation_key": key, "error": type(error).__name__, "message": str(error)}
-            )
+            failure = {
+                "type": "ask_failed",
+                "reservation_key": key,
+                "error": type(error).__name__,
+                "message": str(error),
+            }
+            if isinstance(error, httpx.HTTPStatusError):
+                failure.update(_provider_http_failure(error))
+            self._append_log(failure)
+            if isinstance(error, httpx.HTTPStatusError):
+                raise WorldCapabilityError(_provider_http_message("web-research", error)) from error
             raise
 
     async def browse(self, starting_point_id: str, offset_bytes: int = 0) -> dict[str, object]:

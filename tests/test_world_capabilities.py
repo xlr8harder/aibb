@@ -197,7 +197,11 @@ async def test_ask_uses_sol_native_research_and_returns_resolving_sources(tmp_pa
 @pytest.mark.asyncio
 async def test_failed_sol_research_does_not_charge_its_conservative_cost_reservation(tmp_path: Path) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": {"message": "invalid request"}})
+        return httpx.Response(
+            400,
+            headers={"x-request-id": "req-research-400", "set-cookie": "must-not-be-logged"},
+            json={"error": {"code": 400, "message": "invalid request"}},
+        )
 
     world = WorldCapabilityState(
         tmp_path,
@@ -207,7 +211,10 @@ async def test_failed_sol_research_does_not_charge_its_conservative_cost_reserva
         resolver=_resolver,
     )
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(
+        WorldCapabilityError,
+        match=r"web-research provider request failed with HTTP 400: invalid request \(request ID req-research-400\)",
+    ):
         await world.ask("What changed today?")
 
     remaining = world.ledger.remaining()["web"]
@@ -215,6 +222,72 @@ async def test_failed_sol_research_does_not_charge_its_conservative_cost_reserva
     assert remaining["max_cost_usd"] == 5
     failed = json.loads(world.log_path.read_text().splitlines()[-1])
     assert failed["type"] == "ask_failed"
+    assert failed["http_status"] == 400
+    assert failed["response_headers"] == {
+        "content-type": "application/json",
+        "x-request-id": "req-research-400",
+    }
+    assert failed["provider_response"] == {"error": {"code": 400, "message": "invalid request"}}
+    assert "must-not-be-logged" not in world.log_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_failed_web_search_preserves_sanitized_provider_error_details(tmp_path: Path) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"cf-ray": "example-ray", "x-request-id": "req-search-400"},
+            json={
+                "error": {
+                    "code": 400,
+                    "message": "invalid server tool parameters",
+                    "metadata": {
+                        "engine": "perplexity",
+                        "authorization": "Bearer response-secret",
+                    },
+                }
+            },
+        )
+
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key="operator-only-secret",
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    with pytest.raises(
+        WorldCapabilityError,
+        match=(
+            r"web-search provider request failed with HTTP 400: invalid server tool parameters "
+            r"\(request ID req-search-400\)"
+        ),
+    ):
+        await world.search("specific current question")
+
+    remaining = world.ledger.remaining()["web"]
+    assert remaining["max_calls"] == 39
+    assert remaining["max_cost_usd"] == 5
+    failed = json.loads(world.log_path.read_text().splitlines()[-1])
+    assert failed["type"] == "search_failed"
+    assert failed["error"] == "HTTPStatusError"
+    assert failed["http_status"] == 400
+    assert failed["response_headers"] == {
+        "cf-ray": "example-ray",
+        "content-type": "application/json",
+        "x-request-id": "req-search-400",
+    }
+    assert failed["provider_response"] == {
+        "error": {
+            "code": 400,
+            "message": "invalid server tool parameters",
+            "metadata": {"authorization": "[redacted]", "engine": "perplexity"},
+        }
+    }
+    log = world.log_path.read_text()
+    assert "response-secret" not in log
+    assert "operator-only-secret" not in log
 
 
 @pytest.mark.asyncio
