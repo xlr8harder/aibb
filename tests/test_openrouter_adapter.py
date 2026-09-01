@@ -299,6 +299,70 @@ async def test_openrouter_adapter_reports_embedded_http_200_provider_error(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_openrouter_adapter_preserves_non_success_response_details(tmp_path: Path) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            headers={"x-request-id": "request-route-404", "content-type": "application/json"},
+            json={
+                "error": {
+                    "code": 404,
+                    "message": "No endpoints found that can handle the requested parameters.",
+                }
+            },
+        )
+
+    manifest = make_manifest()
+    ledger = BudgetLedger(tmp_path / "mcp/budgets.json", manifest)
+    session = SessionStore(tmp_path / "session", manifest.run_id)
+    adapter = OpenRouterAdapter(
+        api_key="private-test-key",
+        ledger=ledger,
+        session=session,
+        max_output_tokens=500,
+        prompt_price_per_token=0.000001,
+        completion_price_per_token=0.000006,
+        app_url="https://archive.example/",
+        transport=httpx.MockTransport(handler),
+    )
+    engine = AibbHarnessEngine(
+        model=openrouter_model(
+            "example/model",
+            context_window=100_000,
+            max_tokens=500,
+            prompt_price_per_token=0.000001,
+            completion_price_per_token=0.000006,
+        ),
+        system_prompt="",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Continue."}], "timestamp": 1}],
+        tools=[],
+        stream_fn=adapter,
+    )
+
+    await engine.begin()
+
+    events = [json.loads(line) for line in (tmp_path / "session/events.jsonl").read_text().splitlines()]
+    provider_response = next(event for event in events if event["type"] == "provider_response")
+    assert provider_response["payload"] == {
+        "reservation_key": "inference-0001",
+        "http_status": 404,
+        "headers": {"x-request-id": "request-route-404", "content-type": "application/json"},
+        "response": {
+            "error": {
+                "code": 404,
+                "message": "No endpoints found that can handle the requested parameters.",
+            }
+        },
+    }
+    provider_error = next(event for event in events if event["type"] == "provider_error")
+    assert provider_error["payload"]["type"] == "RuntimeError"
+    assert provider_error["payload"]["message"] == (
+        "OpenRouter HTTP 404: No endpoints found that can handle the requested parameters."
+    )
+    assert ledger.read().accounts["inference"].used.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_anthropic_openrouter_requests_use_sticky_session_and_rolling_cache_breakpoints(
     tmp_path: Path,
 ) -> None:

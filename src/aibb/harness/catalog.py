@@ -212,6 +212,18 @@ class OpenRouterEndpointRecord(BaseModel):
             return bool(self.supports_tool_choice.get(value, False))
         return "tool_choice" in self.supported_parameters
 
+    @property
+    def supports_openrouter_parameter_filter(self) -> bool:
+        """Whether OpenRouter's legacy require-parameters filter sees tool choice.
+
+        OpenRouter can advertise working value-level tool-choice support while
+        omitting the generic parameter from ``supported_parameters``. Its router
+        still rejects those endpoints when ``require_parameters`` is true, so a
+        locally verified, provider-pinned route must bypass that legacy filter.
+        """
+
+        return "tool_choice" in self.supported_parameters
+
 
 async def fetch_openrouter_endpoint(
     model_id: str,

@@ -43,6 +43,7 @@ ANTHROPIC_CACHE_TTL = "1h"
 ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1
 ANTHROPIC_CACHE_WRITE_MULTIPLIER = 2.0
 MAX_ANTHROPIC_CACHE_BREAKPOINTS = 4
+MAX_PROVIDER_ERROR_TEXT_CHARS = 4_000
 
 
 def _encode_reasoning_details(value: list[dict[str, Any]]) -> str:
@@ -313,6 +314,37 @@ def _estimate_payload_tokens(payload: dict[str, Any]) -> int:
     return estimate_json_tokens(payload)
 
 
+def _http_error_record(response: httpx.Response) -> tuple[dict[str, Any], str]:
+    """Return bounded provider diagnostics and a concise operator message."""
+
+    try:
+        decoded = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        text = response.text
+        record: dict[str, Any] = {
+            "body_text": text[:MAX_PROVIDER_ERROR_TEXT_CHARS],
+            "body_truncated": len(text) > MAX_PROVIDER_ERROR_TEXT_CHARS,
+        }
+        return record, f"OpenRouter HTTP {response.status_code}: {record['body_text'] or response.reason_phrase}"
+
+    error = decoded.get("error") if isinstance(decoded, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = str(error.get("message") or response.reason_phrase)[:MAX_PROVIDER_ERROR_TEXT_CHARS]
+        record = {"error": {"code": code, "message": message}}
+        prefix = f"OpenRouter HTTP {response.status_code}"
+        if code is not None and str(code) != str(response.status_code):
+            prefix += f" (provider code {code})"
+        return record, f"{prefix}: {message}"
+
+    serialized = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    record = {
+        "body_json": serialized[:MAX_PROVIDER_ERROR_TEXT_CHARS],
+        "body_truncated": len(serialized) > MAX_PROVIDER_ERROR_TEXT_CHARS,
+    }
+    return record, f"OpenRouter HTTP {response.status_code}: {record['body_json']}"
+
+
 class OpenRouterAdapter:
     def __init__(
         self,
@@ -451,6 +483,24 @@ class OpenRouterAdapter:
                     headers=self.request_headers,
                     json=payload,
                 )
+            if response.is_error:
+                error_record, error_message = _http_error_record(response)
+                self.last_response = error_record
+                self.session.append(
+                    "provider_response",
+                    {
+                        "reservation_key": reservation_key,
+                        "http_status": response.status_code,
+                        "headers": {
+                            name: value
+                            for name, value in response.headers.items()
+                            if name.lower() in {"x-request-id", "openrouter-processing-time", "content-type"}
+                        },
+                        "response": error_record,
+                    },
+                    "private_provider",
+                )
+                raise RuntimeError(error_message)
             response.raise_for_status()
             raw = response.json()
             self.last_response = raw

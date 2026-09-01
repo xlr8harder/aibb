@@ -142,6 +142,23 @@ def test_openrouter_provider_pin_is_immutable_and_serialized() -> None:
     }
 
 
+def test_openrouter_provider_pin_can_record_local_parameter_verification() -> None:
+    routing = OpenRouterRoutingConfiguration(
+        provider_slug="anthropic",
+        provider_name="Anthropic",
+        require_parameters=False,
+        quantization="unknown",
+    )
+
+    restored = OpenRouterRoutingConfiguration.model_validate_json(routing.model_dump_json())
+
+    assert restored.request_parameter() == {
+        "order": ["anthropic"],
+        "allow_fallbacks": False,
+        "require_parameters": False,
+    }
+
+
 def test_budget_extension_only_increases_selected_limits_and_preserves_usage(tmp_path: Path) -> None:
     ledger = BudgetLedger(tmp_path / "budgets.json", make_manifest())
     ledger.reserve("inference", "turn-1", Usage(calls=1, input_tokens=100, total_tokens=100))

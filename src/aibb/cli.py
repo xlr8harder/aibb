@@ -2697,6 +2697,7 @@ def run_model(
                 OpenRouterRoutingConfiguration(
                     provider_slug=openrouter_provider,
                     provider_name=endpoint_catalog.provider_name,
+                    require_parameters=endpoint_catalog.supports_openrouter_parameter_filter,
                     quantization=endpoint_catalog.quantization,
                 )
                 if openrouter_provider is not None and endpoint_catalog is not None

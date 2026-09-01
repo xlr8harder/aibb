@@ -71,7 +71,7 @@ class OpenRouterRoutingConfiguration(BaseModel):
     provider_slug: str = Field(pattern=r"^[a-z0-9][a-z0-9._/-]{1,119}$")
     provider_name: str | None = Field(default=None, min_length=1, max_length=160)
     allow_fallbacks: Literal[False] = False
-    require_parameters: Literal[True] = True
+    require_parameters: bool = True
     quantization: str | None = Field(default=None, min_length=1, max_length=80)
 
     def request_parameter(self) -> dict[str, object]:

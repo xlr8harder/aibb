@@ -218,6 +218,7 @@ async def test_specific_openrouter_endpoint_accepts_value_level_tool_choice_supp
 
     assert endpoint.accepts_tool_choice("auto")
     assert endpoint.accepts_tool_choice("required")
+    assert not endpoint.supports_openrouter_parameter_filter
 
 
 @pytest.mark.asyncio
