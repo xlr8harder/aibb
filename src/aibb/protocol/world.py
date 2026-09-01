@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -11,6 +12,7 @@ import socket
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,12 @@ CURRENT_STARTING_POINTS_VERSION = "v0.2"
 MAX_FETCH_BYTES = 100_000
 MAX_PAGE_DOWNLOAD_BYTES = 5_000_000
 ALLOWED_FETCH_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
+FETCH_MAX_ATTEMPTS = 3
+FETCH_FORBIDDEN_MAX_ATTEMPTS = 2
+FETCH_RETRYABLE_STATUSES = frozenset({403, 408, 425, 429})
+FETCH_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+FETCH_RETRY_JITTER_MAX_SECONDS = 0.25
+FETCH_RETRY_AFTER_MAX_SECONDS = 10.0
 
 
 class WorldCapabilityError(ValueError):
@@ -325,6 +333,60 @@ def _provider_http_message(capability: str, error: httpx.HTTPStatusError) -> str
     if request_id:
         message += f" (request ID {request_id})"
     return message
+
+
+def _fetch_http_failure(error: httpx.HTTPStatusError) -> dict[str, Any]:
+    """Record useful response metadata without retaining an arbitrary page body."""
+    response = error.response
+    headers = {
+        name.casefold(): value
+        for name, value in response.headers.items()
+        if name.casefold() in PROVIDER_ERROR_HEADERS
+    }
+    details: dict[str, Any] = {"http_status": response.status_code}
+    if headers:
+        details["response_headers"] = headers
+    return details
+
+
+def _fetch_retry_attempt_limit(error: Exception) -> int:
+    if isinstance(error, httpx.TransportError):
+        return FETCH_MAX_ATTEMPTS
+    if not isinstance(error, httpx.HTTPStatusError):
+        return 1
+    status = error.response.status_code
+    if status == 403:
+        return FETCH_FORBIDDEN_MAX_ATTEMPTS
+    if status in FETCH_RETRYABLE_STATUSES or 500 <= status <= 599:
+        return FETCH_MAX_ATTEMPTS
+    return 1
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    if response.status_code not in {429, 503}:
+        return None
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay = (retry_at - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return min(FETCH_RETRY_AFTER_MAX_SECONDS, max(0.0, delay))
+
+
+def _fetch_retry_delay(*, attempt: int, reservation_key: str, response: httpx.Response | None) -> float:
+    base_delay = FETCH_RETRY_BACKOFF_SECONDS[attempt - 1]
+    retry_after = _retry_after_seconds(response) if response is not None else None
+    jitter_seed = hashlib.sha256(f"{reservation_key}:{attempt}".encode()).digest()[0]
+    jitter = jitter_seed / 255 * FETCH_RETRY_JITTER_MAX_SECONDS
+    return min(FETCH_RETRY_AFTER_MAX_SECONDS, max(base_delay, retry_after or 0.0) + jitter)
 
 
 def _public_address(address: str) -> bool:
@@ -834,121 +896,170 @@ class WorldCapabilityState:
         return await self._fetch("verify", url, content_offset=offset_bytes)
 
     async def _fetch(self, capability: str, url: str, *, content_offset: int = 0) -> dict[str, object]:
-        current = validate_public_url(url, resolver=self.resolver)
-        key, requested = self._reserve(capability, request_bytes=len(current.encode("utf-8")))
-        self._append_log({"type": f"{capability}_requested", "reservation_key": key, "url": current})
+        requested_url = validate_public_url(url, resolver=self.resolver)
+        current = requested_url
+        attempts = 0
+        key, requested = self._reserve(capability, request_bytes=len(requested_url.encode("utf-8")))
+        self._append_log({"type": f"{capability}_requested", "reservation_key": key, "url": requested_url})
         try:
-            redirects: list[str] = []
             async with httpx.AsyncClient(timeout=30, transport=self.transport, follow_redirects=False) as client:
-                for _ in range(6):
-                    user_agent_title = (self.manifest.archive_title or "Archive").replace(" ", "-")
-                    async with client.stream(
-                        "GET", current, headers={"User-Agent": f"{user_agent_title}/0.1 research fetch"}
-                    ) as response:
-                        if response.is_redirect:
-                            location = response.headers.get("location")
-                            if not location:
-                                raise WorldCapabilityError("remote server returned a redirect without a location")
-                            current = validate_public_url(urljoin(current, location), resolver=self.resolver)
-                            redirects.append(current)
-                            continue
-                        response.raise_for_status()
-                        content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
-                        if not any(content_type.startswith(value) for value in ALLOWED_FETCH_TYPES):
-                            received_type = content_type or "unknown"
-                            raise WorldCapabilityError(
-                                f"fetch_public_url only returns textual content, not {received_type}"
-                            )
-                        chunks: list[bytes] = []
-                        size = 0
-                        content_ceiling = max(1, requested.result_bytes - 4_096)
-                        html_content = content_type in {"text/html", "application/xhtml+xml"}
-                        download_ceiling = MAX_PAGE_DOWNLOAD_BYTES if html_content else content_ceiling
-                        remote_truncated = False
-                        async for chunk in response.aiter_bytes():
-                            if size + len(chunk) > download_ceiling:
+                for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+                    attempts = attempt
+                    current = requested_url
+                    redirects: list[str] = []
+                    retry_error: httpx.HTTPStatusError | httpx.TransportError | None = None
+                    retry_response: httpx.Response | None = None
+                    try:
+                        for _ in range(6):
+                            user_agent_title = (self.manifest.archive_title or "Archive").replace(" ", "-")
+                            async with client.stream(
+                                "GET", current, headers={"User-Agent": f"{user_agent_title}/0.1 research fetch"}
+                            ) as response:
+                                if response.is_redirect:
+                                    location = response.headers.get("location")
+                                    if not location:
+                                        raise WorldCapabilityError(
+                                            "remote server returned a redirect without a location"
+                                        )
+                                    current = validate_public_url(urljoin(current, location), resolver=self.resolver)
+                                    redirects.append(current)
+                                    continue
+                                response.raise_for_status()
+                                content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
+                                if not any(content_type.startswith(value) for value in ALLOWED_FETCH_TYPES):
+                                    received_type = content_type or "unknown"
+                                    raise WorldCapabilityError(
+                                        f"fetch_public_url only returns textual content, not {received_type}"
+                                    )
+                                chunks: list[bytes] = []
+                                size = 0
+                                content_ceiling = max(1, requested.result_bytes - 4_096)
+                                html_content = content_type in {"text/html", "application/xhtml+xml"}
+                                download_ceiling = MAX_PAGE_DOWNLOAD_BYTES if html_content else content_ceiling
+                                remote_truncated = False
+                                async for chunk in response.aiter_bytes():
+                                    if size + len(chunk) > download_ceiling:
+                                        if html_content:
+                                            chunks.append(chunk[: max(0, download_ceiling - size)])
+                                            size = download_ceiling
+                                            remote_truncated = True
+                                            break
+                                        raise WorldCapabilityError(
+                                            f"remote content exceeds this call's {content_ceiling}-byte content ceiling"
+                                        )
+                                    size += len(chunk)
+                                    chunks.append(chunk)
+                                raw = b"".join(chunks)
+                                decoded = raw.decode(response.encoding or "utf-8", errors="replace")
                                 if html_content:
-                                    chunks.append(chunk[: max(0, download_ceiling - size)])
-                                    size = download_ceiling
-                                    remote_truncated = True
-                                    break
-                                raise WorldCapabilityError(
-                                    f"remote content exceeds this call's {content_ceiling}-byte content ceiling"
+                                    parser = _ReadableHtml(base_url=str(response.url))
+                                    parser.feed(decoded)
+                                    text = parser.text()
+                                    content_format = "extracted_markdown"
+                                else:
+                                    text = decoded
+                                    content_format = "raw_text"
+                                available_content_bytes = len(text.encode("utf-8"))
+                                text = _utf8_slice(text, content_offset, content_ceiling)
+                                returned_content_bytes = len(text.encode("utf-8"))
+                                next_offset = content_offset + returned_content_bytes
+                                has_more_extracted = next_offset < available_content_bytes
+                                result = {
+                                    "kind": "untrusted_remote_content",
+                                    "requested_url": url,
+                                    "resolved_url": str(response.url),
+                                    "redirects": redirects,
+                                    "content_type": content_type,
+                                    "content_format": content_format,
+                                    "content_sha256": hashlib.sha256(raw).hexdigest(),
+                                    "content_offset_bytes": content_offset,
+                                    "available_content_bytes": available_content_bytes,
+                                    "returned_content_bytes": returned_content_bytes,
+                                    "remote_download_truncated": remote_truncated,
+                                    "truncated": remote_truncated or has_more_extracted,
+                                    "next_offset_bytes": next_offset if has_more_extracted else None,
+                                    "content": text,
+                                }
+                                result_bytes = _fit_result_content(result, requested.result_bytes)
+                                returned_content_bytes = len(str(result["content"]).encode("utf-8"))
+                                next_offset = content_offset + returned_content_bytes
+                                has_more_extracted = next_offset < available_content_bytes
+                                result["returned_content_bytes"] = returned_content_bytes
+                                result["truncated"] = remote_truncated or has_more_extracted
+                                result["next_offset_bytes"] = next_offset if has_more_extracted else None
+                                result_bytes = _fit_result_content(result, requested.result_bytes)
+                                self.ledger.reconcile(
+                                    self._budget_account(capability),
+                                    key,
+                                    Usage(
+                                        calls=1,
+                                        request_bytes=len(url.encode("utf-8")),
+                                        result_bytes=result_bytes,
+                                    ),
                                 )
-                            size += len(chunk)
-                            chunks.append(chunk)
-                        raw = b"".join(chunks)
-                        decoded = raw.decode(response.encoding or "utf-8", errors="replace")
-                        if html_content:
-                            parser = _ReadableHtml(base_url=str(response.url))
-                            parser.feed(decoded)
-                            text = parser.text()
-                            content_format = "extracted_markdown"
-                        else:
-                            text = decoded
-                            content_format = "raw_text"
-                        available_content_bytes = len(text.encode("utf-8"))
-                        text = _utf8_slice(text, content_offset, content_ceiling)
-                        returned_content_bytes = len(text.encode("utf-8"))
-                        next_offset = content_offset + returned_content_bytes
-                        has_more_extracted = next_offset < available_content_bytes
-                        result = {
-                            "kind": "untrusted_remote_content",
-                            "requested_url": url,
-                            "resolved_url": str(response.url),
-                            "redirects": redirects,
-                            "content_type": content_type,
-                            "content_format": content_format,
-                            "content_sha256": hashlib.sha256(raw).hexdigest(),
-                            "content_offset_bytes": content_offset,
-                            "available_content_bytes": available_content_bytes,
-                            "returned_content_bytes": returned_content_bytes,
-                            "remote_download_truncated": remote_truncated,
-                            "truncated": remote_truncated or has_more_extracted,
-                            "next_offset_bytes": next_offset if has_more_extracted else None,
-                            "content": text,
-                        }
-                        result_bytes = _fit_result_content(result, requested.result_bytes)
-                        returned_content_bytes = len(str(result["content"]).encode("utf-8"))
-                        next_offset = content_offset + returned_content_bytes
-                        has_more_extracted = next_offset < available_content_bytes
-                        result["returned_content_bytes"] = returned_content_bytes
-                        result["truncated"] = remote_truncated or has_more_extracted
-                        result["next_offset_bytes"] = next_offset if has_more_extracted else None
-                        result_bytes = _fit_result_content(result, requested.result_bytes)
-                        self.ledger.reconcile(
-                            self._budget_account(capability),
-                            key,
-                            Usage(
-                                calls=1,
-                                request_bytes=len(url.encode("utf-8")),
-                                result_bytes=result_bytes,
-                            ),
-                        )
-                        self._append_log(
-                            {
-                                "type": f"{capability}_completed",
-                                "reservation_key": key,
-                                "resolved_url": str(response.url),
-                                "content_sha256": result["content_sha256"],
-                                "content_bytes": len(raw),
-                            }
-                        )
-                        return result
-                raise WorldCapabilityError("remote URL exceeded the five-redirect limit")
+                                self._append_log(
+                                    {
+                                        "type": f"{capability}_completed",
+                                        "reservation_key": key,
+                                        "resolved_url": str(response.url),
+                                        "content_sha256": result["content_sha256"],
+                                        "content_bytes": len(raw),
+                                        "attempts": attempts,
+                                    }
+                                )
+                                return result
+                        raise WorldCapabilityError("remote URL exceeded the five-redirect limit")
+                    except (httpx.HTTPStatusError, httpx.TransportError) as error:
+                        retry_error = error
+                        retry_response = error.response if isinstance(error, httpx.HTTPStatusError) else None
+
+                    assert retry_error is not None
+                    attempt_limit = _fetch_retry_attempt_limit(retry_error)
+                    if attempt >= attempt_limit:
+                        raise retry_error
+                    delay = _fetch_retry_delay(
+                        attempt=attempt,
+                        reservation_key=key,
+                        response=retry_response,
+                    )
+                    retry_event: dict[str, Any] = {
+                        "type": f"{capability}_retry_scheduled",
+                        "reservation_key": key,
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "max_attempts": attempt_limit,
+                        "delay_seconds": delay,
+                        "last_resolved_url": current,
+                        "error": type(retry_error).__name__,
+                    }
+                    if isinstance(retry_error, httpx.HTTPStatusError):
+                        retry_event.update(_fetch_http_failure(retry_error))
+                    self._append_log(retry_event)
+                    await asyncio.sleep(delay)
         except Exception as error:
             budget_account = self._budget_account(capability)
             account = self.ledger.read().accounts[budget_account]
             if key in account.reservations:
                 self.ledger.reconcile(budget_account, key, requested)
-            self._append_log(
-                {
-                    "type": f"{capability}_failed",
-                    "reservation_key": key,
-                    "requested_url": url,
-                    "last_resolved_url": current,
-                    "error": type(error).__name__,
-                    "message": str(error),
-                }
-            )
+            failure: dict[str, Any] = {
+                "type": f"{capability}_failed",
+                "reservation_key": key,
+                "requested_url": url,
+                "last_resolved_url": current,
+                "attempts": attempts,
+                "error": type(error).__name__,
+                "message": str(error),
+            }
+            if isinstance(error, httpx.HTTPStatusError):
+                failure.update(_fetch_http_failure(error))
+            self._append_log(failure)
+            attempt_label = "attempt" if attempts == 1 else "attempts"
+            if isinstance(error, httpx.HTTPStatusError):
+                raise WorldCapabilityError(
+                    f"remote server returned HTTP {error.response.status_code} after {attempts} {attempt_label}"
+                ) from error
+            if isinstance(error, httpx.TransportError):
+                raise WorldCapabilityError(
+                    f"remote request failed after {attempts} {attempt_label}: {type(error).__name__}"
+                ) from error
             raise

@@ -429,6 +429,206 @@ async def test_research_browse_and_verify_share_one_generous_web_budget(tmp_path
     }
 
 
+@pytest.mark.asyncio
+async def test_fetch_retries_one_transient_403_without_extra_budget_or_visible_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+    delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(403, headers={"cf-ray": "transient-ray", "set-cookie": "private"})
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="available now")
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("aibb.protocol.world.asyncio.sleep", record_sleep)
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    result = await world.verify("https://example.com/transient")
+
+    assert requests == 2
+    assert len(delays) == 1
+    assert 1 <= delays[0] <= 1.25
+    assert "attempts" not in result
+    assert result["content"] == "available now"
+    assert world.ledger.remaining()["web"]["max_calls"] == 39
+    events = [json.loads(line) for line in world.log_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == [
+        "verify_requested",
+        "verify_retry_scheduled",
+        "verify_completed",
+    ]
+    assert events[1]["attempt"] == 1
+    assert events[1]["max_attempts"] == 2
+    assert events[1]["http_status"] == 403
+    assert events[1]["response_headers"] == {"cf-ray": "transient-ray"}
+    assert events[2]["attempts"] == 2
+    assert "private" not in world.log_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_fetch_stops_after_one_403_retry_and_reports_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+    delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(403, headers={"x-request-id": f"req-{requests}"})
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("aibb.protocol.world.asyncio.sleep", record_sleep)
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    with pytest.raises(WorldCapabilityError, match="remote server returned HTTP 403 after 2 attempts"):
+        await world.verify("https://example.com/forbidden")
+
+    assert requests == 2
+    assert len(delays) == 1
+    assert world.ledger.remaining()["web"]["max_calls"] == 39
+    events = [json.loads(line) for line in world.log_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == [
+        "verify_requested",
+        "verify_retry_scheduled",
+        "verify_failed",
+    ]
+    assert events[-1]["attempts"] == 2
+    assert events[-1]["http_status"] == 403
+    assert events[-1]["response_headers"] == {"x-request-id": "req-2"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_retries_503_twice_and_honors_bounded_retry_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+    delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests < 3:
+            return httpx.Response(503, headers={"retry-after": "2"})
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="recovered")
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("aibb.protocol.world.asyncio.sleep", record_sleep)
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    result = await world.verify("https://example.com/unavailable")
+
+    assert result["content"] == "recovered"
+    assert requests == 3
+    assert len(delays) == 2
+    assert 2 <= delays[0] <= 2.25
+    assert 3 <= delays[1] <= 3.25
+    assert world.ledger.remaining()["web"]["max_calls"] == 39
+    events = [json.loads(line) for line in world.log_path.read_text().splitlines()]
+    retries = [event for event in events if event["type"] == "verify_retry_scheduled"]
+    assert [event["attempt"] for event in retries] == [1, 2]
+    assert all(event["max_attempts"] == 3 for event in retries)
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_retry_nontransient_http_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(404)
+
+    async def fail_if_called(_delay: float) -> None:
+        pytest.fail("nontransient errors must not sleep or retry")
+
+    monkeypatch.setattr("aibb.protocol.world.asyncio.sleep", fail_if_called)
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    with pytest.raises(WorldCapabilityError, match="remote server returned HTTP 404 after 1 attempt"):
+        await world.verify("https://example.com/missing")
+
+    assert requests == 1
+    assert world.ledger.remaining()["web"]["max_calls"] == 39
+    events = [json.loads(line) for line in world.log_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == ["verify_requested", "verify_failed"]
+    assert events[-1]["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_retries_transport_failure_and_restarts_redirect_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths: list[str] = []
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if paths == ["/start"]:
+            return httpx.Response(302, headers={"location": "/article"})
+        if paths == ["/start", "/article"]:
+            raise httpx.ReadTimeout("stream interrupted", request=request)
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"location": "/article"})
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="complete")
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("aibb.protocol.world.asyncio.sleep", record_sleep)
+    world = WorldCapabilityState(
+        tmp_path,
+        _manifest(),
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    result = await world.verify("https://example.com/start")
+
+    assert paths == ["/start", "/article", "/start", "/article"]
+    assert result["redirects"] == ["https://example.com/article"]
+    assert result["content"] == "complete"
+    assert len(delays) == 1
+    assert world.ledger.remaining()["web"]["max_calls"] == 39
+
+
 def test_legacy_separate_world_budgets_remain_resumable(tmp_path: Path) -> None:
     legacy = make_manifest().model_copy(
         update={
