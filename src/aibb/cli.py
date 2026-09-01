@@ -2658,7 +2658,9 @@ def run_model(
             catalog = asyncio.run(fetch_openrouter_model(model))
             inferred_display_name = catalog.display_name
             endpoint_catalog = (
-                asyncio.run(fetch_openrouter_endpoint(model, openrouter_provider)) if openrouter_provider else None
+                asyncio.run(fetch_openrouter_endpoint(model, openrouter_provider, tool_choice=tool_choice))
+                if openrouter_provider
+                else None
             )
             catalog_context_window = min(
                 catalog.effective_context_length,

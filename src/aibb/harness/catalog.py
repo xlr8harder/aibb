@@ -175,6 +175,7 @@ class OpenRouterEndpointRecord(BaseModel):
     quantization: str | None = None
     max_completion_tokens: int | None = Field(default=None, ge=1)
     supported_parameters: list[str] = Field(default_factory=list)
+    supports_tool_choice: dict[str, bool] | None = None
 
     @property
     def prompt_price(self) -> float:
@@ -199,11 +200,24 @@ class OpenRouterEndpointRecord(BaseModel):
             return "max_completion_tokens"
         return "max_tokens"
 
+    def accepts_tool_choice(self, value: Literal["auto", "required"]) -> bool:
+        """Honor OpenRouter's value-level capability when it is advertised.
+
+        Older endpoint records expose only the generic ``tool_choice`` entry in
+        ``supported_parameters``. Newer records may omit that entry and instead
+        report support for each accepted value in ``supports_tool_choice``.
+        """
+
+        if self.supports_tool_choice is not None:
+            return bool(self.supports_tool_choice.get(value, False))
+        return "tool_choice" in self.supported_parameters
+
 
 async def fetch_openrouter_endpoint(
     model_id: str,
     provider_slug: str,
     *,
+    tool_choice: Literal["auto", "required"] = "auto",
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> OpenRouterEndpointRecord:
     """Resolve and verify a specific provider route before binding a run."""
@@ -220,11 +234,16 @@ async def fetch_openrouter_endpoint(
         raise ValueError(f"OpenRouter model {model_id!r} has no endpoint matching provider {provider_slug!r}")
     endpoint = sorted(matches, key=lambda item: item.tag)[0]
     supported = set(endpoint.supported_parameters)
-    missing = {"tools", "tool_choice"} - supported
+    missing = {"tools"} - supported
     if missing:
         raise ValueError(
             f"OpenRouter endpoint {endpoint.tag!r} for {model_id!r} does not advertise required parameters: "
             + ", ".join(sorted(missing))
+        )
+    if not endpoint.accepts_tool_choice(tool_choice):
+        raise ValueError(
+            f"OpenRouter endpoint {endpoint.tag!r} for {model_id!r} does not advertise "
+            f"tool_choice={tool_choice!r} support"
         )
     if not {"max_tokens", "max_completion_tokens"} & supported:
         raise ValueError(

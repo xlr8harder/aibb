@@ -1216,6 +1216,7 @@ async def run_model_visit(
             await fetch_openrouter_endpoint(
                 manifest.identity.model_name,
                 manifest.openrouter_routing.provider_slug,
+                tool_choice=manifest.tool_choice,
             )
             if manifest.openrouter_routing is not None
             else None

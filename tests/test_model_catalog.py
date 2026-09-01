@@ -182,6 +182,77 @@ async def test_specific_openrouter_endpoint_rejects_missing_tool_choice() -> Non
 
 
 @pytest.mark.asyncio
+async def test_specific_openrouter_endpoint_accepts_value_level_tool_choice_support() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "endpoints": [
+                        {
+                            "name": "Example",
+                            "model_id": "example/model",
+                            "provider_name": "Example",
+                            "tag": "example",
+                            "context_length": 10_000,
+                            "pricing": {"prompt": "0.0", "completion": "0.0"},
+                            "supported_parameters": ["tools", "max_tokens"],
+                            "supports_tool_choice": {
+                                "none": True,
+                                "auto": True,
+                                "required": True,
+                                "function": True,
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+
+    endpoint = await fetch_openrouter_endpoint(
+        "example/model",
+        "example",
+        tool_choice="required",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert endpoint.accepts_tool_choice("auto")
+    assert endpoint.accepts_tool_choice("required")
+
+
+@pytest.mark.asyncio
+async def test_specific_openrouter_endpoint_rejects_unadvertised_tool_choice_value() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "endpoints": [
+                        {
+                            "name": "Example",
+                            "model_id": "example/model",
+                            "provider_name": "Example",
+                            "tag": "example",
+                            "context_length": 10_000,
+                            "pricing": {"prompt": "0.0", "completion": "0.0"},
+                            "supported_parameters": ["tools", "max_tokens"],
+                            "supports_tool_choice": {"auto": True, "required": False},
+                        }
+                    ]
+                }
+            },
+        )
+
+    with pytest.raises(ValueError, match="tool_choice='required'"):
+        await fetch_openrouter_endpoint(
+            "example/model",
+            "example",
+            tool_choice="required",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+@pytest.mark.asyncio
 async def test_specific_openrouter_endpoint_rejects_missing_output_token_parameter() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
