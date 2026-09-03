@@ -77,7 +77,7 @@ from aibb.harness.tinker import (
     tinker_model,
 )
 from aibb.harness.watch import latest_run_directory, watch_event_stream, watch_state_root
-from aibb.publish import check_publication, deploy_publication, prepare_publication
+from aibb.publish import PublicationError, check_publication, deploy_publication, prepare_publication
 from aibb.rounds import (
     RoundError,
     begin_round,
@@ -1343,12 +1343,15 @@ def publish_deploy(
 ) -> None:
     """Deploy a clean, pushed generated-site commit to Cloudflare Pages."""
 
-    output = deploy_publication(
-        site_repo=site_repo,
-        project_name=project_name,
-        branch=branch,
-        wrangler_command=wrangler_command,
-    )
+    try:
+        output = deploy_publication(
+            site_repo=site_repo,
+            project_name=project_name,
+            branch=branch,
+            wrangler_command=wrangler_command,
+        )
+    except PublicationError as error:
+        raise typer.BadParameter(str(error)) from error
     typer.echo(output)
 
 

@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 from test_archive_build import _write_archive
+from typer.testing import CliRunner
 
+from aibb.cli import app
 from aibb.publish import PublicationError, check_publication, deploy_publication, prepare_publication
 
 
@@ -50,6 +52,35 @@ def _repositories(tmp_path: Path) -> tuple[Path, Path, Path]:
     (site / ".github/workflows/validate.yml").write_text("name: keep me\n")
     _commit_all(site, "site")
     return code, data, site
+
+
+def _deployable_site(tmp_path: Path) -> tuple[Path, str]:
+    site = tmp_path / "site"
+    bare = tmp_path / "site.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    _init_repo(site, remote=str(bare))
+    (site / "index.html").write_text("published\n")
+    (site / ".github/workflows").mkdir(parents=True)
+    (site / ".github/workflows/validate.yml").write_text("name: private CI metadata\n")
+    (site / "publication.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "site": "https://archive.example/",
+                "builder": {
+                    "repository": "https://github.com/example/slowboard",
+                    "revision": "a" * 40,
+                },
+                "data": {
+                    "repository": "https://github.com/example/slowboard-data",
+                    "revision": "b" * 40,
+                },
+            }
+        )
+    )
+    head = _commit_all(site, "publication")
+    _git(site, "push", "-u", "origin", "main")
+    return site, head
 
 
 def test_prepare_and_check_publication_are_revision_bound_and_deterministic(tmp_path: Path) -> None:
@@ -113,31 +144,7 @@ def test_prepare_refuses_local_preview_base_url(tmp_path: Path) -> None:
 
 
 def test_deploy_uses_pushed_commit_archive_and_cleans_wrangler_cache(tmp_path: Path) -> None:
-    site = tmp_path / "site"
-    bare = tmp_path / "site.git"
-    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
-    _init_repo(site, remote=str(bare))
-    (site / "index.html").write_text("published\n")
-    (site / ".github/workflows").mkdir(parents=True)
-    (site / ".github/workflows/validate.yml").write_text("name: private CI metadata\n")
-    (site / "publication.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "site": "https://archive.example/",
-                "builder": {
-                    "repository": "https://github.com/example/slowboard",
-                    "revision": "a" * 40,
-                },
-                "data": {
-                    "repository": "https://github.com/example/slowboard-data",
-                    "revision": "b" * 40,
-                },
-            }
-        )
-    )
-    head = _commit_all(site, "publication")
-    _git(site, "push", "-u", "origin", "main")
+    site, head = _deployable_site(tmp_path)
     arguments_path = tmp_path / "wrangler-arguments.json"
     fake = tmp_path / "fake_wrangler.py"
     fake.write_text(
@@ -170,3 +177,60 @@ def test_deploy_uses_pushed_commit_archive_and_cleans_wrangler_cache(tmp_path: P
     assert output == "https://test.slowboard.pages.dev"
     assert invocation["workflow_uploaded"] is False
     assert not (site / ".wrangler").exists()
+
+
+def test_deploy_reports_missing_wrangler_executable(tmp_path: Path) -> None:
+    site, _ = _deployable_site(tmp_path)
+
+    with pytest.raises(PublicationError, match="Wrangler executable 'not-a-real-wrangler'.*--wrangler-command"):
+        deploy_publication(
+            site_repo=site,
+            project_name="slowboard",
+            wrangler_command="not-a-real-wrangler",
+        )
+
+
+def test_deploy_reports_wrangler_stderr_and_cleans_cache(tmp_path: Path) -> None:
+    site, _ = _deployable_site(tmp_path)
+    fake = tmp_path / "failing_wrangler.py"
+    fake.write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path('.wrangler/cache').mkdir(parents=True)\n"
+        "print('\\x1b[31mProject does not exist: wrong-project\\x1b[0m', file=sys.stderr)\n"
+        "raise SystemExit(1)\n"
+    )
+
+    with pytest.raises(
+        PublicationError,
+        match="Wrangler deployment failed with exit code 1: Project does not exist: wrong-project",
+    ) as raised:
+        deploy_publication(
+            site_repo=site,
+            project_name="wrong-project",
+            wrangler_command=f"{sys.executable} {fake}",
+        )
+
+    assert "\x1b" not in str(raised.value)
+    assert not (site / ".wrangler").exists()
+
+
+def test_publish_deploy_cli_renders_publication_errors_without_traceback(tmp_path: Path) -> None:
+    site, _ = _deployable_site(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "publish",
+            "deploy",
+            "--site-repo",
+            str(site),
+            "--project-name",
+            "slowboard",
+            "--wrangler-command",
+            "not-a-real-wrangler",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Wrangler executable 'not-a-real-wrangler' was not found" in result.output
+    assert "Traceback" not in result.output

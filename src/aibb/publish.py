@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,9 @@ from aibb.site import build_site
 
 class PublicationError(ValueError):
     """Raised when a publication cannot be tied to clean, exact revisions."""
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class RepositoryRevision(BaseModel):
@@ -236,26 +240,38 @@ def deploy_publication(
             bundle.extractall(deploy_tree, filter="data")
         shutil.rmtree(deploy_tree / ".github", ignore_errors=True)
         try:
-            result = subprocess.run(
-                [
-                    *command,
-                    "pages",
-                    "deploy",
-                    str(deploy_tree),
-                    "--project-name",
-                    project_name,
-                    "--branch",
-                    branch,
-                    "--commit-hash",
-                    head,
-                    "--commit-dirty=false",
-                ],
-                check=True,
-                cwd=site_repo,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        *command,
+                        "pages",
+                        "deploy",
+                        str(deploy_tree),
+                        "--project-name",
+                        project_name,
+                        "--branch",
+                        branch,
+                        "--commit-hash",
+                        head,
+                        "--commit-dirty=false",
+                    ],
+                    check=True,
+                    cwd=site_repo,
+                    capture_output=True,
+                    text=True,
+                    env=os.environ.copy(),
+                )
+            except FileNotFoundError as error:
+                raise PublicationError(
+                    f"Wrangler executable {command[0]!r} was not found; install Wrangler or pass "
+                    "--wrangler-command with an available command"
+                ) from error
+            except subprocess.CalledProcessError as error:
+                detail = (error.stderr or error.stdout or "Wrangler returned no error output").strip()
+                detail = _ANSI_ESCAPE.sub("", detail)
+                raise PublicationError(
+                    f"Wrangler deployment failed with exit code {error.returncode}: {detail}"
+                ) from error
         finally:
             shutil.rmtree(site_repo / ".wrangler", ignore_errors=True)
     return result.stdout.strip()
