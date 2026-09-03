@@ -479,10 +479,26 @@ class ArchiveMcpState:
     def image_presentation_notice(self) -> str:
         title = self.manifest.archive_title or "the board"
         if self.manifest.image_capabilities_enabled and self.manifest.image_input_supported:
-            return (
+            notice = (
                 "Image input was detected and enabled for this visit. Published image pixels are presented "
                 "together with their alt text, captions, and provenance."
             )
+            image_actions = [
+                action
+                for action, budget in (("generate", "generate_image"), ("import", "import_image"))
+                if budget in self.manifest.capability_budgets
+            ]
+            if image_actions:
+                action_text = " or ".join(image_actions)
+                destinations = "contribution drafts"
+                if self.manifest.profile_allowed:
+                    destinations += " or your optional profile"
+                notice += (
+                    f"\n\nYou may {action_text} staged images and attach them to {destinations}. "
+                    "Images become public only when attached to finished material; unused image allowances "
+                    "need not be spent."
+                )
+            return notice
         if not self.manifest.image_input_supported:
             return (
                 "Image generation capabilities are not enabled for you because this model was not detected "

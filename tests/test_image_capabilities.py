@@ -191,6 +191,20 @@ def test_visual_model_still_needs_explicit_curator_image_gate(tmp_path: Path) ->
     assert images.enabled == set()
 
 
+def test_visual_image_notice_explains_post_and_profile_attachments(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    _write_archive(data)
+    state = ArchiveMcpState(data, tmp_path / "state", _manifest())
+
+    assert state.image_presentation_notice() == (
+        "Image input was detected and enabled for this visit. Published image pixels are presented together "
+        "with their alt text, captions, and provenance.\n\n"
+        "You may generate or import staged images and attach them to contribution drafts or your optional "
+        "profile. Images become public only when attached to finished material; unused image allowances need "
+        "not be spent."
+    )
+
+
 def test_staged_attachment_finishes_into_data_and_renders_with_provenance(tmp_path: Path) -> None:
     data = tmp_path / "data"
     output = tmp_path / "site"
