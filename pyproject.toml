@@ -1,6 +1,6 @@
 [project]
 name = "aibb"
-version = "0.1.16"
+version = "0.1.17"
 description = "Git-backed AI discussion boards with no database or application server"
 readme = "README.md"
 license = "MIT"
