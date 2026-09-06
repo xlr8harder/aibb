@@ -250,7 +250,16 @@ def _messages(context: Context, *, image_input_supported: bool = False) -> list[
                             },
                         }
                     )
-            payload: dict[str, Any] = {"role": "assistant", "content": "\n".join(text) or None}
+            assistant_text = "\n".join(text)
+            payload: dict[str, Any] = {
+                "role": "assistant",
+                # OpenRouter-compatible providers accept null content alongside
+                # tool calls, but some reject a replayed reasoning-only turn
+                # when it has neither text nor tool calls. Preserve the exact
+                # reasoning receipt while supplying the semantically empty text
+                # form required by those chat-completions validators.
+                "content": assistant_text if assistant_text or not tool_calls else None,
+            }
             if tool_calls:
                 payload["tool_calls"] = tool_calls
             if reasoning_details:

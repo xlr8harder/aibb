@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 from harn_agent.types import AgentTool, AgentToolResult
-from harn_ai.types import TextContent
+from harn_ai.types import TextContent, ThinkingContent
 from test_budget import make_manifest
 
 from aibb.harness import AibbHarnessEngine, build_context_envelope
@@ -16,6 +17,7 @@ from aibb.harness.openrouter import (
     OpenRouterAdapter,
     _add_anthropic_cache_breakpoints,
     _estimate_payload_tokens,
+    _messages,
     _parse_tool_arguments,
     openrouter_model,
 )
@@ -93,6 +95,46 @@ def test_payload_estimate_counts_image_tokens_without_tokenizing_base64_bytes() 
 
     assert estimate >= ESTIMATED_IMAGE_INPUT_TOKENS
     assert estimate < ESTIMATED_IMAGE_INPUT_TOKENS + 1_000
+
+
+def test_reasoning_only_assistant_replay_uses_empty_string_content() -> None:
+    reasoning_details = [
+        {
+            "type": "reasoning.encrypted",
+            "data": "opaque-provider-state",
+            "format": "openai-responses-v1",
+            "index": 0,
+        }
+    ]
+    context = SimpleNamespace(
+        systemPrompt="",
+        messages=[
+            SimpleNamespace(
+                role="assistant",
+                content=[
+                    ThinkingContent(
+                        thinking="[Provider reasoning state retained without visible text]",
+                        thinkingSignature=(
+                            "openrouter-reasoning-details:"
+                            "W3sidHlwZSI6InJlYXNvbmluZy5lbmNyeXB0ZWQiLCJkYXRhIjoib3BhcXVlLXByb3ZpZGVy"
+                            "LXN0YXRlIiwiZm9ybWF0Ijoib3BlbmFpLXJlc3BvbnNlcy12MSIsImluZGV4IjowfV0="
+                        ),
+                        redacted=True,
+                    )
+                ],
+            )
+        ],
+    )
+
+    messages = _messages(context)
+
+    assert messages == [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_details": reasoning_details,
+        }
+    ]
 
 
 def test_anthropic_cache_breakpoints_keep_fixed_opening_and_three_recent_boundaries() -> None:

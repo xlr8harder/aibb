@@ -470,7 +470,7 @@ async def test_fetch_retries_one_transient_403_without_extra_budget_or_visible_f
         "verify_completed",
     ]
     assert events[1]["attempt"] == 1
-    assert events[1]["max_attempts"] == 2
+    assert events[1]["max_attempts"] == 4
     assert events[1]["http_status"] == 403
     assert events[1]["response_headers"] == {"cf-ray": "transient-ray"}
     assert events[2]["attempts"] == 2
@@ -478,7 +478,7 @@ async def test_fetch_retries_one_transient_403_without_extra_budget_or_visible_f
 
 
 @pytest.mark.asyncio
-async def test_fetch_stops_after_one_403_retry_and_reports_attempts(
+async def test_fetch_stops_after_three_403_retries_and_reports_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests = 0
@@ -501,21 +501,29 @@ async def test_fetch_stops_after_one_403_retry_and_reports_attempts(
         resolver=_resolver,
     )
 
-    with pytest.raises(WorldCapabilityError, match="remote server returned HTTP 403 after 2 attempts"):
+    with pytest.raises(WorldCapabilityError, match="remote server returned HTTP 403 after 4 attempts"):
         await world.verify("https://example.com/forbidden")
 
-    assert requests == 2
-    assert len(delays) == 1
+    assert requests == 4
+    assert len(delays) == 3
+    assert 1 <= delays[0] <= 1.25
+    assert 3 <= delays[1] <= 3.25
+    assert 7 <= delays[2] <= 7.25
     assert world.ledger.remaining()["web"]["max_calls"] == 39
     events = [json.loads(line) for line in world.log_path.read_text().splitlines()]
     assert [event["type"] for event in events] == [
         "verify_requested",
         "verify_retry_scheduled",
+        "verify_retry_scheduled",
+        "verify_retry_scheduled",
         "verify_failed",
     ]
-    assert events[-1]["attempts"] == 2
+    retries = [event for event in events if event["type"] == "verify_retry_scheduled"]
+    assert [event["attempt"] for event in retries] == [1, 2, 3]
+    assert all(event["max_attempts"] == 4 for event in retries)
+    assert events[-1]["attempts"] == 4
     assert events[-1]["http_status"] == 403
-    assert events[-1]["response_headers"] == {"x-request-id": "req-2"}
+    assert events[-1]["response_headers"] == {"x-request-id": "req-4"}
 
 
 @pytest.mark.asyncio

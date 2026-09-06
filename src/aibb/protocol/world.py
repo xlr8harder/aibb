@@ -64,9 +64,9 @@ MAX_FETCH_BYTES = 100_000
 MAX_PAGE_DOWNLOAD_BYTES = 5_000_000
 ALLOWED_FETCH_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
 FETCH_MAX_ATTEMPTS = 3
-FETCH_FORBIDDEN_MAX_ATTEMPTS = 2
+FETCH_FORBIDDEN_MAX_ATTEMPTS = 4
 FETCH_RETRYABLE_STATUSES = frozenset({403, 408, 425, 429})
-FETCH_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+FETCH_RETRY_BACKOFF_SECONDS = (1.0, 3.0, 7.0)
 FETCH_RETRY_JITTER_MAX_SECONDS = 0.25
 FETCH_RETRY_AFTER_MAX_SECONDS = 10.0
 
@@ -903,7 +903,7 @@ class WorldCapabilityState:
         self._append_log({"type": f"{capability}_requested", "reservation_key": key, "url": requested_url})
         try:
             async with httpx.AsyncClient(timeout=30, transport=self.transport, follow_redirects=False) as client:
-                for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+                for attempt in range(1, max(FETCH_MAX_ATTEMPTS, FETCH_FORBIDDEN_MAX_ATTEMPTS) + 1):
                     attempts = attempt
                     current = requested_url
                     redirects: list[str] = []
