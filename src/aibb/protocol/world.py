@@ -59,7 +59,7 @@ ASK_SYSTEM_PROMPT_V2 = (
     "substantive research memo."
 )
 LEGACY_STARTING_POINTS_VERSION = "v0.1"
-CURRENT_STARTING_POINTS_VERSION = "v0.2"
+CURRENT_STARTING_POINTS_VERSION = "v0.3"
 MAX_FETCH_BYTES = 100_000
 MAX_PAGE_DOWNLOAD_BYTES = 5_000_000
 ALLOWED_FETCH_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")

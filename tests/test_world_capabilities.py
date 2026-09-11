@@ -67,18 +67,22 @@ def test_world_tool_schemas_are_explicit_and_starting_points_are_versioned() -> 
     assert "with web search" in tools["research_web"].description
     assert "without a synthesized research memo" in tools["search_web"].description
     assert tools["search_web"].inputSchema["properties"]["query"]["maxLength"] == 2000
-    assert "ap-world" in tools["browse_web_source"].inputSchema["properties"]["starting_point_id"]["enum"]
+    assert "bbc-world" in tools["browse_web_source"].inputSchema["properties"]["starting_point_id"]["enum"]
+    assert "ap-world" not in tools["browse_web_source"].inputSchema["properties"]["starting_point_id"]["enum"]
     assert "digg-tech" not in tools["browse_web_source"].inputSchema["properties"]["starting_point_id"]["enum"]
     assert tools["fetch_url"].inputSchema["properties"]["url"]["maxLength"] == 2048
     assert tools["fetch_url"].inputSchema["properties"]["offset_bytes"]["minimum"] == 0
 
 
-def test_new_starting_points_disable_digg_without_mutating_legacy_runs() -> None:
+def test_new_starting_points_replace_ap_without_mutating_legacy_runs() -> None:
     current = load_starting_points()
+    previous = load_starting_points("v0.2")
     legacy = load_starting_points("v0.1")
 
-    assert current.id == CURRENT_STARTING_POINTS_VERSION == "v0.2"
-    assert {point.id for point in current.starting_points} == {"wikipedia-current-events", "ap-world"}
+    assert current.id == CURRENT_STARTING_POINTS_VERSION == "v0.3"
+    assert {point.id for point in current.starting_points} == {"wikipedia-current-events", "bbc-world"}
+    assert "ap-world" in {point.id for point in previous.starting_points}
+    assert "bbc-world" not in {point.id for point in previous.starting_points}
     assert "digg-tech" in {point.id for point in legacy.starting_points}
     assert starting_points_sha256(current.id) == starting_points_sha256()
 
@@ -93,6 +97,40 @@ def test_run_bound_starting_points_digest_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(WorldCapabilityError, match="does not match the run-bound digest"):
         WorldCapabilityState(tmp_path, manifest, openrouter_api_key=None)
+
+
+@pytest.mark.asyncio
+async def test_current_bbc_world_starting_point_routes_and_extracts_content(tmp_path: Path) -> None:
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text='<main><h1>World</h1><a href="/news/articles/example">Current headline</a></main>',
+        )
+
+    manifest = _manifest().model_copy(
+        update={
+            "starting_points_version": CURRENT_STARTING_POINTS_VERSION,
+            "starting_points_sha256": starting_points_sha256(),
+        }
+    )
+    world = WorldCapabilityState(
+        tmp_path,
+        manifest,
+        openrouter_api_key=None,
+        transport=httpx.MockTransport(handler),
+        resolver=_resolver,
+    )
+
+    result = await world.browse("bbc-world")
+
+    assert requested_urls == ["https://www.bbc.com/news/world"]
+    assert result["starting_points_version"] == "v0.3"
+    assert result["starting_point"]["id"] == "bbc-world"
+    assert "[Current headline](https://www.bbc.com/news/articles/example)" in result["content"]
 
 
 def test_paid_research_tool_is_omitted_without_its_operator_credential(tmp_path: Path) -> None:

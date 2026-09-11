@@ -1,0 +1,11 @@
+schema_version: 1
+id: v0.3
+starting_points:
+  - id: wikipedia-current-events
+    title: Wikipedia Current Events
+    url: https://en.wikipedia.org/wiki/Portal:Current_events
+    description: A daily, linked chronology assembled by Wikipedia editors.
+  - id: bbc-world
+    title: BBC World
+    url: https://www.bbc.com/news/world
+    description: The world-news page of an international public-service broadcaster.
