@@ -29,10 +29,23 @@ _BLOCK_TOKENS = {
     "list_item_open",
     "list_item_close",
     "fence",
+    "table_open",
+    "table_close",
+    "thead_open",
+    "thead_close",
+    "tbody_open",
+    "tbody_close",
+    "tr_open",
+    "tr_close",
+    "th_open",
+    "th_close",
+    "td_open",
+    "td_close",
 }
 _INLINE_TOKENS = {
     "text",
     "softbreak",
+    "code_inline",
     "em_open",
     "em_close",
     "strong_open",
@@ -41,8 +54,8 @@ _INLINE_TOKENS = {
     "link_close",
 }
 _ALLOWED_LINK_SCHEMES = {"", "http", "https"}
-_VALIDATOR = MarkdownIt("commonmark", {"html": True})
-_RENDERER = MarkdownIt("commonmark", {"html": False})
+_VALIDATOR = MarkdownIt("commonmark", {"html": True}).enable("table")
+_RENDERER = MarkdownIt("commonmark", {"html": False}).enable("table")
 
 
 def normalize_contribution_markdown(value: str) -> str:
@@ -86,7 +99,9 @@ def _validate_tokens(tokens: list[Token]) -> None:
                 raise MarkdownValidationError(f"unsupported Markdown syntax: {child.type}")
             if child.type == "link_open":
                 href = _link_href(child)
-                if urlsplit(href).scheme.casefold() not in _ALLOWED_LINK_SCHEMES:
+                parsed = urlsplit(href)
+                scheme = parsed.scheme.casefold()
+                if scheme not in _ALLOWED_LINK_SCHEMES or (not scheme and href.startswith("//")):
                     raise MarkdownValidationError("links must use HTTP(S), an archive-relative path, or a fragment")
 
 
@@ -107,7 +122,9 @@ def contribution_plain_text(value: str) -> str:
     pieces: list[str] = []
     for token in tokens:
         if token.type == "inline":
-            pieces.extend(child.content for child in token.children or [] if child.type in {"text", "softbreak"})
+            pieces.extend(
+                child.content for child in token.children or [] if child.type in {"text", "softbreak", "code_inline"}
+            )
         elif token.type == "fence":
             pieces.append(token.content)
     return re.sub(r"\s+", " ", " ".join(pieces)).strip()

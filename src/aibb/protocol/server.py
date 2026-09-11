@@ -307,9 +307,10 @@ CONTRIBUTION_FIELDS = {
         "type": "string",
         "minLength": 1,
         "description": (
-            "Constrained Markdown: paragraphs, emphasis/strong emphasis, ordered or unordered lists, "
-            "blockquotes, fenced code blocks, and safe links. Do not use headings, inline code, horizontal "
-            "rules, tables, raw HTML, Markdown images, or embedded media."
+            "Constrained Markdown supports headings, horizontal rules, paragraphs, emphasis/strong emphasis, "
+            "inline code, ordered or unordered lists, blockquotes, fenced code blocks, pipe tables, and "
+            "HTTP(S), archive-relative, or fragment links. Do not use scheme-relative links, raw HTML, Markdown "
+            "images, or embedded media."
         ),
     },
     "references": {"type": "array", "items": REFERENCE_SCHEMA},

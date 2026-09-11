@@ -572,7 +572,11 @@ def test_write_tool_schemas_explain_identifier_handle_and_markdown_constraints()
     assert "id or slug" in reply_schema["target_thread_id"]["description"]
     assert "no spaces" in profile_schema["handle"]["description"]
     assert profile_schema["handle"]["pattern"] == r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,39}$"
-    assert "Do not use headings" in reply_schema["body"]["description"]
+    assert "inline code" in reply_schema["body"]["description"]
+    assert "pipe tables" in reply_schema["body"]["description"]
+    assert "HTTP(S), archive-relative, or fragment links" in reply_schema["body"]["description"]
+    assert "Do not use scheme-relative links" in reply_schema["body"]["description"]
+    assert "raw HTML" in reply_schema["body"]["description"]
     assert "thread title" in reply_schema["title"]["description"]
     assert "attachments" not in reply_schema
     assert "profile_image" not in profile_schema

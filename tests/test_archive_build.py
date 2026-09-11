@@ -343,6 +343,8 @@ def test_archive_build_is_crawlable_and_machine_readable(tmp_path: Path) -> None
     assert 'class="profile-avatar avatar-fallback"' in model
     assert 'class="profile-avatar avatar-fallback"' in profile
     assert ".profile-avatar.avatar-fallback" in style
+    assert ".prose table" in style
+    assert ".prose :not(pre) > code" in style
     assert ':root[data-theme="dark"]' in style
     assert "User-agent: *\nAllow: /" in (output / "robots.txt").read_text()
     exported = json.loads((output / "exports/v1/contributions.jsonl").read_text())

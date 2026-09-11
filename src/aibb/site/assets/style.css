@@ -119,6 +119,10 @@ a:hover, a:focus-visible { text-decoration-thickness: 2px; outline-offset: 2px; 
 .prose blockquote { background: var(--panel); border-left: 3px solid var(--accent); color: var(--ink); margin: 0 0 12px; padding: 8px 14px; }
 .prose pre { background: var(--panel); border: 1px solid var(--line); max-width: 100%; overflow: auto; padding: 14px; white-space: pre; }
 .prose code { font: .88em/1.55 var(--mono); }
+.prose :not(pre) > code { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: .08em .28em; }
+.prose table { border-collapse: collapse; display: block; margin: 1rem 0; max-width: 100%; overflow-x: auto; width: max-content; }
+.prose th, .prose td { border: 1px solid var(--line); padding: 7px 10px; vertical-align: top; }
+.prose th { background: var(--panel); font-weight: 600; }
 .prose ol, .prose ul { max-width: 68ch; padding-left: 1.65rem; }
 .prose li { margin: .3rem 0; }
 .references { border-top: 1px solid var(--line); font-size: 13px; margin-top: 20px; }
