@@ -44,6 +44,8 @@ ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1
 ANTHROPIC_CACHE_WRITE_MULTIPLIER = 2.0
 MAX_ANTHROPIC_CACHE_BREAKPOINTS = 4
 MAX_PROVIDER_ERROR_TEXT_CHARS = 4_000
+MAX_RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_RETRY_DELAY_SECONDS = 30
 
 
 def _encode_reasoning_details(value: list[dict[str, Any]]) -> str:
@@ -479,19 +481,61 @@ class OpenRouterAdapter:
             cost_usd=reserved_cost,
             request_bytes=len(json.dumps(payload, ensure_ascii=False).encode()),
         )
+        attempts = 0
+        rate_limited = False
         try:
             self.ledger.reserve("inference", reservation_key, requested)
-            self.session.append(
-                "provider_request",
-                {"reservation_key": reservation_key, "endpoint": self.endpoint, "payload": payload},
-                "private_provider",
-            )
             async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
-                response = await client.post(
-                    self.endpoint,
-                    headers=self.request_headers,
-                    json=payload,
-                )
+                while True:
+                    attempts += 1
+                    self.session.append(
+                        "provider_request",
+                        {
+                            "reservation_key": reservation_key,
+                            "attempt": attempts,
+                            "endpoint": self.endpoint,
+                            "payload": payload,
+                        },
+                        "private_provider",
+                    )
+                    response = await client.post(
+                        self.endpoint,
+                        headers=self.request_headers,
+                        json=payload,
+                    )
+                    if response.status_code != 429:
+                        break
+                    error_record, error_message = _http_error_record(response)
+                    self.last_response = error_record
+                    self.session.append(
+                        "provider_response",
+                        {
+                            "reservation_key": reservation_key,
+                            "attempt": attempts,
+                            "http_status": 429,
+                            "headers": {
+                                name: value
+                                for name, value in response.headers.items()
+                                if name.lower() in {"x-request-id", "openrouter-processing-time", "content-type"}
+                            },
+                            "response": error_record,
+                        },
+                        "private_provider",
+                    )
+                    if attempts > MAX_RATE_LIMIT_RETRIES:
+                        rate_limited = True
+                        raise RuntimeError(error_message)
+                    self.session.append(
+                        "provider_retry_scheduled",
+                        {
+                            "reservation_key": reservation_key,
+                            "attempt": attempts,
+                            "delay_seconds": RATE_LIMIT_RETRY_DELAY_SECONDS,
+                            "reason": "OpenRouter HTTP 429",
+                        },
+                        "operator",
+                    )
+                    await asyncio.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
             if response.is_error:
                 error_record, error_message = _http_error_record(response)
                 self.last_response = error_record
@@ -561,7 +605,7 @@ class OpenRouterAdapter:
                     output_tokens=output_tokens,
                     total_tokens=total_tokens,
                     cost_usd=actual_cost,
-                    request_bytes=requested.request_bytes,
+                    request_bytes=requested.request_bytes * attempts,
                     result_bytes=len(response.content),
                 ),
             )
@@ -672,7 +716,10 @@ class OpenRouterAdapter:
                 self.ledger.reconcile(
                     "inference",
                     reservation_key,
-                    LedgerUsage(calls=1, request_bytes=requested.request_bytes),
+                    LedgerUsage(
+                        calls=0 if rate_limited else 1,
+                        request_bytes=requested.request_bytes * attempts,
+                    ),
                 )
             self.session.append(
                 "provider_error",

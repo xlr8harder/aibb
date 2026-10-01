@@ -12,6 +12,7 @@ from harn_ai.types import TextContent, ThinkingContent
 from test_budget import make_manifest
 
 from aibb.harness import AibbHarnessEngine, build_context_envelope
+from aibb.harness import openrouter as openrouter_module
 from aibb.harness.openrouter import (
     MAX_TOOL_CALLS_PER_RESPONSE,
     OpenRouterAdapter,
@@ -402,6 +403,77 @@ async def test_openrouter_adapter_preserves_non_success_response_details(tmp_pat
         "OpenRouter HTTP 404: No endpoints found that can handle the requested parameters."
     )
     assert ledger.read().accounts["inference"].used.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_openrouter_429_retries_without_spending_successful_call_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recover: bool
+) -> None:
+    monkeypatch.setattr(openrouter_module, "MAX_RATE_LIMIT_RETRIES", 2)
+    monkeypatch.setattr(openrouter_module, "RATE_LIMIT_RETRY_DELAY_SECONDS", 0)
+    requests: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.content)
+        if len(requests) <= 2 or not recover:
+            return httpx.Response(429, json={"error": {"code": 429, "message": "Provider returned error"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-recovered",
+                "model": "example/model",
+                "choices": [
+                    {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Ready."}}
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            },
+        )
+
+    manifest = make_manifest()
+    ledger = BudgetLedger(tmp_path / "mcp/budgets.json", manifest)
+    session = SessionStore(tmp_path / "session", manifest.run_id)
+    adapter = OpenRouterAdapter(
+        api_key="private-test-key",
+        ledger=ledger,
+        session=session,
+        max_output_tokens=500,
+        prompt_price_per_token=0.000001,
+        completion_price_per_token=0.000006,
+        app_url="https://archive.example/",
+        transport=httpx.MockTransport(handler),
+    )
+    engine = AibbHarnessEngine(
+        model=openrouter_model(
+            "example/model",
+            context_window=100_000,
+            max_tokens=500,
+            prompt_price_per_token=0.000001,
+            completion_price_per_token=0.000006,
+        ),
+        system_prompt="",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Continue."}], "timestamp": 1}],
+        tools=[],
+        stream_fn=adapter,
+    )
+
+    await engine.begin()
+
+    events = [json.loads(line) for line in (tmp_path / "session/events.jsonl").read_text().splitlines()]
+    assert len(requests) == 3
+    assert requests[0] == requests[1] == requests[2]
+    assert [event["payload"]["attempt"] for event in events if event["type"] == "provider_request"] == [1, 2, 3]
+    assert len([event for event in events if event["type"] == "provider_retry_scheduled"]) == 2
+    account = ledger.read().accounts["inference"]
+    assert account.used.calls == (1 if recover else 0)
+    assert account.used.total_tokens == (12 if recover else 0)
+    assert account.used.request_bytes == len(json.dumps(json.loads(requests[0])).encode()) * 3
+    if recover:
+        assert engine.messages[-1].content[0].text == "Ready."
+        assert not [event for event in events if event["type"] == "provider_error"]
+    else:
+        assert engine.messages[-1].stopReason == "error"
+        assert [event for event in events if event["type"] == "provider_error"]
 
 
 @pytest.mark.asyncio

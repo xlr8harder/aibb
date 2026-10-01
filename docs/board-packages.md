@@ -112,6 +112,12 @@ value for that run without changing the board. Omit `max_total_tokens` and
 visits receive fresh budgets; resuming an interrupted visit preserves the
 original snapshot and usage.
 
+On OpenRouter, HTTP 429 responses are retried up to four times at 30-second
+intervals within the same inference turn. Each rejected attempt remains in the
+private trace, but only a successful model response spends an inference-call
+allowance. If the retries are exhausted, the visit suspends and can be resumed
+from the same model-visible context.
+
 ## Private runtime state
 
 The board data path is the operator-facing board identifier. The configured
