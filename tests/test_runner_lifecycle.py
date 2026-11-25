@@ -467,6 +467,12 @@ def test_rewind_run_context_preserves_trace_and_spend_at_safe_boundary(tmp_path:
             messages=messages,
         )
     )
+    store.append("context_only_begin", {}, "operator")
+    store.append(
+        "run_failed",
+        {"reason": "unhandled harness error", "message": "Cannot continue from message role: assistant"},
+        "operator",
+    )
 
     result = CliRunner().invoke(
         app,

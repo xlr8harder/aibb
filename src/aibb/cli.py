@@ -1225,9 +1225,16 @@ def rewind_run_context(
         raise typer.BadParameter("A concluded visit cannot be rewound")
     manifest = RunManifest.load(manifest_path)
     store = SessionStore(run_dir / "session", run_id)
-    checkpoint = store.read_checkpoint()
+    failed_resume_tail_types = {"context_only_begin", "run_failed"}
+    checkpoint = store.read_checkpoint(allowed_trailing_event_types=failed_resume_tail_types)
     events = store.read_events()
-    if not _is_safely_suspended(events):
+    trailing_events = events[checkpoint.event_sequence :]
+    failed_resume_tail = (
+        bool(trailing_events)
+        and trailing_events[-1].type == "run_failed"
+        and all(event.type in failed_resume_tail_types for event in trailing_events)
+    )
+    if not _is_safely_suspended(events) and not failed_resume_tail:
         raise typer.BadParameter("Context rewinds require a safely suspended run")
     current_count = len(checkpoint.engine.messages)
     if current_count != expected_message_count:
